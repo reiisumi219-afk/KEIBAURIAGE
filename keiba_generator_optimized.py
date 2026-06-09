@@ -7,6 +7,7 @@ import time
 from flask import Flask, request, Response
 from concurrent.futures import ThreadPoolExecutor
 import threading
+import os
 
 app = Flask(__name__)
 
@@ -31,7 +32,6 @@ def get_active_venues(date_str):
     date_yyyymmdd = date_str.replace('-', '')
     
     try:
-        # リクエストごとに新しい Playwright インスタンス
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
@@ -149,7 +149,6 @@ def fetch_all_data(date_str):
     """全データを取得"""
     print(f"[データ取得開始] {date_str}")
     
-    # ステップ1: Playwright で base_code を取得（リクエストごとに独立）
     venues = get_active_venues(date_str)
     print(f"[取得場数] {len(venues)} 場")
     
@@ -159,13 +158,11 @@ def fetch_all_data(date_str):
     
     all_data = {}
     
-    # ステップ2: 各場のデータを並列取得
     for venue in venues:
         name = venue['name']
         base_code = venue['base_code']
         code = venue['code']
         
-        # 発走時刻取得
         times = get_race_times(code, date_str)
         
         if not times:
@@ -175,7 +172,6 @@ def fetch_all_data(date_str):
         
         races = {}
         
-        # 売上を並列取得
         sales_args = [(base_code, race_no) for race_no in range(1, 13) if race_no in times]
         
         with ThreadPoolExecutor(max_workers=6) as executor:
@@ -529,7 +525,6 @@ def index():
     if not date_str:
         date_str = datetime.now().strftime('%Y-%m-%d')
     
-    # キャッシュをチェック（5分有効）
     with cache_lock:
         if date_str in cache:
             cached_time, html_content = cache[date_str]
@@ -543,7 +538,6 @@ def index():
     data = fetch_all_data(date_str)
     html_content = generate_html(data, date_str)
     
-    # キャッシュに保存
     with cache_lock:
         cache[date_str] = (datetime.now(), html_content)
     
@@ -562,5 +556,7 @@ if __name__ == '__main__':
     
     print("\n" + "="*60)
     print("[Flask サーバー起動]")
-port = int(os.environ.get('PORT', 5000))
+    print("="*60 + "\n")
+    
+    port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
