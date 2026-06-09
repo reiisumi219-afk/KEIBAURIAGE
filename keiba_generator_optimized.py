@@ -562,7 +562,5 @@ if __name__ == '__main__':
     
     print("\n" + "="*60)
     print("[Flask サーバー起動]")
-    print("[アクセス] http://192.168.100.41:5000")
-    print("="*60 + "\n")
-    
-    app.run(host='0.0.0.0', port=5000, debug=False)
+port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
