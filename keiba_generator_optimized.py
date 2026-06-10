@@ -1,7 +1,6 @@
-from playwright.sync_api import sync_playwright
 import requests
 from bs4 import BeautifulSoup
-from datetime import datetime
+from datetime import datetime, timedelta
 import re
 import time
 from flask import Flask, request, Response
@@ -26,60 +25,107 @@ VENUE_MAP = {
 
 cache = {}
 cache_lock = threading.Lock()
+today_data = None  # 起動時に取得した当日データ
 
-def get_active_venues(date_str):
-    """Playwright でリクエストごとに独立実行"""
-    date_yyyymmdd = date_str.replace('-', '')
-    
+def get_venues_today(date_yyyymmdd):
+    """当日向け FAST版: nankankeibaトップから base_code を一発取得"""
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-            page.goto("https://www.nankankeiba.com/program/00000000000000.do", wait_until='networkidle')
-            
-            print(f"  [JS] changeJyoBtnSp('{date_yyyymmdd}')")
-            page.evaluate(f"changeJyoBtnSp('{date_yyyymmdd}')")
-            time.sleep(1)
-            
-            html_content = page.content()
-            page.close()
-            browser.close()
-        
-        soup = BeautifulSoup(html_content, 'html.parser')
-        wrap = soup.find('div', class_='navJyoAriaSpWrap')
-        
+        r = requests.get("https://www.nankankeiba.com/", headers=HEADERS, timeout=10)
+        r.encoding = 'shift_jis'
+        codes = sorted(set(re.findall(r'program/(\d{14})\.do', r.text)))
+
         venues = []
         seen = set()
-        
-        if wrap:
-            for item in wrap.find_all('a', href=True):
-                if item.get('class') and 'hidden' in item.get('class'):
-                    continue
-                
-                href = item.get('href', '')
-                if href.endswith('.do') and len(href) == 17:
-                    base_code = href.replace('.do', '')
-                    
-                    if not base_code.startswith(date_yyyymmdd):
-                        continue
-                    
-                    venue_code = base_code[8:10]
-                    
-                    if venue_code not in seen and venue_code in VENUE_MAP:
-                        seen.add(venue_code)
-                        venues.append({
-                            'code': venue_code,
-                            'name': VENUE_MAP[venue_code],
-                            'base_code': base_code
-                        })
-                        print(f"    ✓ {VENUE_MAP[venue_code]}: {base_code}")
-        
+        for base_code in codes:
+            if not base_code.startswith(date_yyyymmdd):
+                continue
+            venue_code = base_code[8:10]
+            if venue_code not in seen and venue_code in VENUE_MAP:
+                seen.add(venue_code)
+                venues.append({
+                    'code': venue_code,
+                    'name': VENUE_MAP[venue_code],
+                    'base_code': base_code
+                })
+                print(f"    \u2713 {VENUE_MAP[venue_code]}: {base_code}")
         return venues
     except Exception as e:
-        print(f"  ✗ エラー: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"  \u2717 \u30a8\u30e9\u30fc: {e}")
         return []
+
+
+def get_baba_codes_from_keibago(date_str):
+    """keiba.go.jp から指定日の開催場コードを取得"""
+    url = "https://www.keiba.go.jp/KeibaWeb/TodayRaceInfo/TodayRaceInfoTop"
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=10)
+        r.encoding = 'utf-8'
+        soup = BeautifulSoup(r.text, 'html.parser')
+        date_slash = date_str.replace('-', '/')
+        codes = set()
+        for link in soup.find_all('a', href=lambda x: x and 'babaCode' in x):
+            href = link.get('href', '')
+            href_dec = href.replace('%2F', '/')
+            if f'k_raceDate={date_slash}' in href_dec and 'k_babaCode=' in href:
+                code = href.split('k_babaCode=')[1][:2]
+                codes.add(code)
+        return sorted(codes)
+    except Exception as e:
+        print(f"  \u2717 keiba.go.jp \u30a8\u30e9\u30fc: {e}")
+        return []
+
+
+def find_base_code(date_yyyymmdd, baba_code):
+    """回次・日次を並列総当たりして正しい base_code を特定"""
+    def check(args):
+        kai, nichi = args
+        base = f"{date_yyyymmdd}{baba_code}{kai:02d}{nichi:02d}"
+        url = f"https://www.nankankeiba.com/program/{base}.do"
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=5)
+            if r.status_code == 200 and 'nk23_c-block01__label' in r.text and date_yyyymmdd in r.text:
+                return base
+        except:
+            pass
+        return None
+
+    candidates = [(kai, nichi) for kai in range(1, 8) for nichi in range(1, 16)]
+    with ThreadPoolExecutor(max_workers=30) as ex:
+        for res in ex.map(check, candidates):
+            if res:
+                return res
+    return None
+
+
+def get_venues_other_day(date_str):
+    """当日以外向け: keiba.go.jpで場コード取得 → 日次総当たりで base_code 特定"""
+    date_yyyymmdd = date_str.replace('-', '')
+    baba_codes = get_baba_codes_from_keibago(date_str)
+
+    if not baba_codes:
+        print(f"  \u2717 \u958b\u50ac\u5834\u304c\u898b\u3064\u304b\u308a\u307e\u305b\u3093")
+        return []
+
+    print(f"  \u958b\u50ac\u5834\u30b3\u30fc\u30c9: {baba_codes}")
+
+    def resolve(baba):
+        base = find_base_code(date_yyyymmdd, baba)
+        return baba, base
+
+    venues = []
+    with ThreadPoolExecutor(max_workers=max(len(baba_codes), 1)) as ex:
+        for baba, base in ex.map(resolve, baba_codes):
+            if base and baba in VENUE_MAP:
+                venues.append({
+                    'code': baba,
+                    'name': VENUE_MAP[baba],
+                    'base_code': base
+                })
+                print(f"    \u2713 {VENUE_MAP[baba]}: {base}")
+            else:
+                print(f"    \u2717 \u5834{baba}: base_code\u7279\u5b9a\u5931\u6557")
+    return venues
+
 
 def get_race_times(baba_code, date_str):
     """発走時刻を取得"""
@@ -149,7 +195,15 @@ def fetch_all_data(date_str):
     """全データを取得"""
     print(f"[データ取得開始] {date_str}")
     
-    venues = get_active_venues(date_str)
+    # 今日の日付と比較
+    today = datetime.now().strftime('%Y-%m-%d')
+    
+    if date_str == today or date_str > today:
+        print(f"  [当日向け FAST版]")
+        venues = get_venues_today(date_str.replace('-', ''))
+    else:
+        print(f"  [当日以外向け]")
+        venues = get_venues_other_day(date_str)
     print(f"[取得場数] {len(venues)} 場")
     
     if len(venues) == 0:
@@ -520,11 +574,26 @@ def generate_html(data, date_str):
 @app.route('/')
 def index():
     """メインページ"""
+    global today_data
+    
     date_str = request.args.get('date')
     
     if not date_str:
         date_str = datetime.now().strftime('%Y-%m-%d')
     
+    today = datetime.now().strftime('%Y-%m-%d')
+    
+    # 当日はキャッシュ（起動時先読み or 遅延ロード）を使う
+    if date_str == today:
+        data = ensure_today_data()
+        print(f"[当日データ] {date_str}")
+        html_content = generate_html(data, date_str)
+        
+        response = Response(html_content, mimetype='text/html')
+        response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+        return response
+    
+    # 過去日付はキャッシュまたは新規取得
     with cache_lock:
         if date_str in cache:
             cached_time, html_content = cache[date_str]
@@ -548,11 +617,29 @@ def index():
     
     return response
 
+def ensure_today_data():
+    """当日データを必要時に取得（lazy load・スレッドセーフ）"""
+    global today_data
+    if today_data is None:
+        with cache_lock:
+            if today_data is None:  # ダブルチェック
+                today_str = datetime.now().strftime('%Y-%m-%d')
+                print(f"[遅延ロード] 当日データ取得: {today_str}")
+                today_data = fetch_all_data(today_str)
+    return today_data
+
+
+@app.route('/health')
+def health():
+    """ヘルスチェック用（即200を返す・スクレイピングしない）"""
+    return Response('OK', mimetype='text/plain')
+
+
 if __name__ == '__main__':
     print("="*60)
     print("[初期化] 当日分のデータを先に取得中...")
     today_str = datetime.now().strftime('%Y-%m-%d')
-    fetch_all_data(today_str)
+    today_data = fetch_all_data(today_str)
     
     print("\n" + "="*60)
     print("[Flask サーバー起動]")
